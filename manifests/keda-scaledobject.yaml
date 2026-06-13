@@ -1,0 +1,39 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-llama3-scaler
+  namespace: inference
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm-llama3
+  pollingInterval: 15
+  cooldownPeriod: 300      # 5min before scaling down (models need time to load)
+  minReplicaCount: 0       # scale to zero overnight
+  maxReplicaCount: 10
+  triggers:
+    # Scale based on pending requests in the vLLM queue
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.monitoring:80
+        metricName: vllm_pending_requests
+        query: |
+          sum(vllm:num_requests_waiting{namespace="inference"})
+        threshold: "5"    # scale up when >5 requests are waiting
+        activationThreshold: "1"
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0    # scale up immediately
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 600  # wait 10min before scale-down
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
