@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama3
+  namespace: inference
+  labels:
+    app: vllm-llama3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-llama3
+  template:
+    metadata:
+      labels:
+        app: vllm-llama3
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        workload-type: gpu-inference
+      # Pull model from S3 cache before starting vLLM
+      initContainers:
+        - name: model-downloader
+          image: amazon/aws-cli:2.15.0
+          command:
+            - sh
+            - -c
+            - |
+              if [ ! -f /mnt/model/config.json ]; then
+                echo "Downloading model from S3 cache..."
+                aws s3 sync s3://$(MODEL_BUCKET)/$(MODEL_NAME)/ /mnt/model/ \
+                  --no-progress --only-show-errors
+              else
+                echo "Model already cached, skipping download."
+              fi
+          env:
+            - name: MODEL_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-config
+                  key: modelBucket
+            - name: MODEL_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: vllm-config
+                  key: modelName
+          volumeMounts:
+            - name: model-cache
+              mountPath: /mnt/model
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.5.5
+          command:
+            - python3
+            - -m
+            - vllm.entrypoints.openai.api_server
+          args:
+            - --model=/mnt/model
+            - --host=0.0.0.0
+            - --port=8000
+            - --tensor-parallel-size=1
+            - --max-model-len=8192
+            - --gpu-memory-utilization=0.90
+            - --disable-log-requests
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /mnt/model
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: inference
+spec:
+  selector:
+    app: vllm-llama3
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-config
+  namespace: inference
+data:
+  modelBucket: "my-model-cache-bucket"
+  modelName: "meta-llama/Meta-Llama-3.1-8B-Instruct"
